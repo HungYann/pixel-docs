@@ -1,0 +1,197 @@
+---
+title: "数据流设计"
+description: "全平台数据流向图：电商交易写路径、AIGC 生成链路、读路径与跨域数据同步"
+---
+
+## 全局数据流总览
+
+```mermaid
+flowchart TD
+    subgraph 入口层
+        C[Client]
+        GW[API Gateway<br/>Request-ID 注入]
+    end
+
+    subgraph 电商写路径
+        OS[Order Service]
+        IS[Inventory Service]
+        PS[Payment Service]
+        DB_ORDER[(MySQL<br/>orders / payments)]
+        REDIS_INV[(Redis<br/>库存预扣)]
+        OUTBOX[(outbox 表)]
+    end
+
+    subgraph 消息总线
+        KAFKA[Kafka<br/>order.paid<br/>content.job<br/>DLQ]
+    end
+
+    subgraph AIGC 生成链路
+        ORCH[Agent Orchestrator]
+        WF[Workflow Service]
+        CG[Content Generator]
+        LLM_GW[LLM Gateway]
+        MONGO[(MySQL<br/>workflow_tasks)]
+        OSS[(OSS + CDN<br/>视频/图片)]
+    end
+
+    subgraph 读路径
+        PROD_SVC[Product Service]
+        L1[进程内 LRU]
+        L2[Redis L2]
+        L3[MySQL 读库]
+        ES[(MySQL FULLTEXT<br/>全文搜索)]
+        PG_VEC[(pgvector<br/>语义搜索)]
+    end
+
+    C --> GW
+    GW --> OS
+    OS --> DB_ORDER
+    OS --> REDIS_INV
+    OS --> OUTBOX
+    OUTBOX -->|Relay Worker| KAFKA
+
+    KAFKA -->|order.paid| ORCH
+    KAFKA -->|content.job| WF
+    ORCH --> LLM_GW
+    WF --> CG
+    CG --> MONGO
+    CG --> OSS
+    CG -->|完成回调| KAFKA
+
+    GW --> PROD_SVC
+    PROD_SVC --> L1 --> L2 --> L3
+    PROD_SVC --> ES
+    PROD_SVC --> PG_VEC
+```
+
+---
+
+## 电商交易写路径
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant GW as API Gateway
+    participant OS as Order Service
+    participant IS as Inventory Service
+    participant PS as Payment Service
+    participant DB as MySQL
+    participant R as Redis
+    participant K as Kafka
+
+    U->>GW: POST /api/v1/order/create
+    GW->>GW: 生成 X-Request-ID
+    GW->>OS: REST POST /internal/orders (request-id)
+    OS->>R: DECRBY stock:sku:SKU001 2   ①Redis 原子预扣
+    R-->>OS: 剩余库存 21
+    OS->>IS: REST POST /internal/inventory/lock
+    IS-->>OS: LOCKED
+    OS->>DB: BEGIN; INSERT orders; INSERT outbox; COMMIT  ③事务写入
+    OS-->>GW: orderId=O001 status=PENDING
+    GW-->>U: 202 {orderId, paymentDeadline}
+
+    U->>GW: POST /api/v1/payment/pay
+    GW->>PS: REST POST /internal/payment/initiate
+    PS-->>GW: {payUrl}
+    GW-->>U: 200 {payUrl}
+
+    Note over PS,K: 支付回调（异步）
+    PS->>DB: BEGIN; UPDATE payments; INSERT outbox; COMMIT
+    DB-->>PS: OK
+    PS->>K: [Relay Worker] order.paid {orderId}
+    K->>OS: 消费 order.paid → 更新 PAID
+```
+
+---
+
+## AIGC 内容生成链路
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant GW as API Gateway
+    participant ORCH as Orchestrator
+    participant LLM as LLM Gateway
+    participant WF as Workflow Service
+    participant CG as Content Generator
+    participant EXT as 外部 API<br/>可灵/即梦
+    participant MG as MySQL
+    participant OSS as OSS/CDN
+    participant K as Kafka
+
+    U->>GW: POST /api/v1/generate/video
+    GW->>ORCH: 意图识别 → video_generate
+    ORCH->>LLM: DeepSeek 解析参数
+    LLM-->>ORCH: {productId, style, duration}
+    ORCH->>WF: 创建 workflow_task
+    WF->>MG: INSERT workflow_tasks {status:PENDING}
+    ORCH-->>GW: taskId=T001 estimatedSeconds=90
+    GW-->>U: 202 {taskId}
+
+    WF->>LLM: Claude 生成脚本（复杂推理）
+    LLM-->>WF: script OK
+    WF->>EXT: 并行：视频生成 + 图片生成 + TTS
+    EXT-->>WF: {videoClipUrl, imageUrl, audioUrl}
+    WF->>CG: FFmpeg 合成
+    CG->>OSS: 上传最终视频
+    CG->>MG: UPDATE workflow_tasks {status:DONE, output}
+    CG->>K: content.done {taskId, videoUrl}
+
+    Note over U,GW: SSE 推送（并行）
+    U->>GW: GET /api/v1/generate/tasks/T001/stream
+    GW-->>U: SSE: progress 10% → 40% → 80% → 100%
+```
+
+---
+
+## 商品读路径（多级缓存）
+
+```mermaid
+flowchart LR
+    U[用户请求] --> PS[Product Service]
+    PS --> L1{进程内 LRU\n命中率 ~90%}
+    L1 -->|命中| R1[返回 ≈0.1ms]
+    L1 -->|未命中| BF{Bloom Filter\n存在性检查}
+    BF -->|不存在| R2[返回 null]
+    BF -->|存在| L2{Redis\n命中率 ~8%}
+    L2 -->|命中| R3[返回 ≈1ms]
+    L2 -->|未命中| LOCK[SETNX 分布式锁\n防击穿]
+    LOCK --> DB[(MySQL 读库)]
+    DB --> R4[返回 ≈10ms\n回填 L2+L1]
+```
+
+---
+
+## 商品搜索路径
+
+```mermaid
+flowchart TD
+    Q[用户搜索关键词]
+    Q --> FT[全文搜索\nMySQL FULLTEXT]
+    Q --> SEM[语义搜索\npgvector BGE-M3\nANN 向量检索]
+    FT --> MERGE[结果合并 & 排序\n相关度 × 销量 × 价格]
+    SEM --> MERGE
+    MERGE --> RES[返回商品列表]
+
+    subgraph RAG 增强
+        RES -->|Top-5 商品| CTX[注入 LLM Context]
+        CTX --> LLM[DeepSeek 生成推荐文案]
+        LLM --> COPY[商品推荐回答]
+    end
+```
+
+---
+
+## 跨域数据同步
+
+| 同步方向 | 触发时机 | 方式 | 延迟容忍 |
+|---------|---------|------|---------|
+| MySQL → Redis 库存 | 服务启动 / 每日凌晨对账 | 定时任务全量同步 | 分钟级 |
+| MySQL FULLTEXT | 商品变更 | MySQL 自动更新 FULLTEXT 索引 | 实时 |
+| MySQL → pgvector | 商品变更 | 异步任务（可接受 1 分钟延迟） | 分钟级 |
+| Kafka → MySQL | AIGC 任务状态变更 | Consumer 实时写入 | 秒级 |
+| MySQL workflow_tasks → OSS | 内容生成完成 | Content Generator 直接上传 | 实时 |
+
+<Note>
+  跨域同步均采用**最终一致**策略，不存在跨服务分布式事务。强一致要求（如下单扣库存）在单服务内通过 Redis Lua 脚本 + DB 乐观锁保证。
+</Note>

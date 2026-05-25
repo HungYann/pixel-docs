@@ -1,0 +1,346 @@
+---
+title: "API 接口设计规范"
+description: "统一 REST API 规范，含电商交易与 AIGC 内容生成完整接口定义"
+---
+
+## 设计规范
+
+| 规则 | 说明 |
+|------|------|
+| 版本前缀 | 所有接口以 `/api/v1/` 开头 |
+| 认证方式 | `Authorization: Bearer <JWT>` |
+| 幂等控制 | 写操作必须携带 `Idempotency-Key` header |
+| 链路追踪 | 请求需携带 `X-Request-ID`，Gateway 不存在时自动生成 |
+| 响应格式 | 统一 `{ code, message, data, requestId }` |
+| 错误码 | 业务错误使用 5 位码：`10001`（参数错误）/ `20001`（库存不足）/ `30001`（生成失败） |
+
+```json
+// 标准响应体
+{
+  "code": 0,
+  "message": "success",
+  "data": { ... },
+  "requestId": "req-550e8400-e29b"
+}
+```
+
+---
+
+## 电商交易接口
+
+### POST /api/v1/order/create
+
+创建订单，触发 Saga 分布式事务（锁库存 → 发起支付）。
+
+**Headers**
+
+```
+Authorization: Bearer <jwt>
+Idempotency-Key: <client-uuid>
+X-Request-ID: <uuid>        # 可选，Gateway 自动生成
+```
+
+**Request**
+
+```json
+{
+  "userId": "U123",
+  "items": [
+    { "skuId": "SKU001", "quantity": 2, "price": 299.00 }
+  ],
+  "addressId": "ADDR456",
+  "couponCode": "DISCOUNT10"
+}
+```
+
+**Response 200**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "orderId": "O1749876543210",
+    "status": "PENDING",
+    "totalAmount": 538.20,
+    "paymentDeadline": "2026-05-26T12:30:00Z"
+  },
+  "requestId": "req-550e8400-e29b"
+}
+```
+
+**Response 409（库存不足）**
+
+```json
+{
+  "code": 20001,
+  "message": "库存不足",
+  "data": { "skuId": "SKU001", "available": 1, "requested": 2 },
+  "requestId": "req-550e8400-e29b"
+}
+```
+
+---
+
+### POST /api/v1/payment/pay
+
+发起支付，返回支付跳转链接（支付宝 / 微信 / Stripe）。
+
+**Request**
+
+```json
+{
+  "orderId": "O1749876543210",
+  "channel": "alipay",          // alipay | wechat | stripe
+  "returnUrl": "https://app.pixel-step.com/order/result"
+}
+```
+
+**Response 200**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "paymentId": "PAY001",
+    "payUrl": "https://openapi.alipay.com/gateway.do?...",
+    "expireAt": "2026-05-26T12:30:00Z"
+  }
+}
+```
+
+---
+
+### POST /api/v1/payment/callback
+
+支付渠道异步回调，需验签（RSA2），幂等处理。仅供支付渠道调用，不对外暴露。
+
+```
+验签 → 更新 Payment 状态 → 写 outbox 表（事务） → Relay Worker → Kafka order.paid
+```
+
+---
+
+### GET /api/v1/order/{orderId}
+
+查询订单详情。
+
+**Response 200**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "orderId": "O1749876543210",
+    "status": "PAID",
+    "items": [{ "skuId": "SKU001", "quantity": 2, "subtotal": 538.20 }],
+    "payment": { "paymentId": "PAY001", "paidAt": "2026-05-26T12:05:00Z" }
+  }
+}
+```
+
+---
+
+### GET /api/v1/inventory/query
+
+查询 SKU 实时库存（Redis 优先，回源 DB）。
+
+**Query Params**: `skuIds=SKU001,SKU002`
+
+**Response 200**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "items": [
+      { "skuId": "SKU001", "available": 23, "locked": 5 },
+      { "skuId": "SKU002", "available": 0, "locked": 0 }
+    ]
+  }
+}
+```
+
+---
+
+## AIGC 内容生成接口
+
+### POST /api/v1/generate/video
+
+提交视频生成任务（异步），立即返回 taskId。
+
+**Request**
+
+```json
+{
+  "productId": "P001",
+  "style": "展示类",            // 展示类 | 剧情类 | 测评类
+  "duration": 30,               // 15 | 30 | 60（秒）
+  "bgmStyle": "轻快",
+  "subtitles": true,
+  "promptHints": "突出红色质感，场景为户外"
+}
+```
+
+**Response 202（已受理）**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "taskId": "T1749876543210",
+    "status": "PENDING",
+    "estimatedSeconds": 90,
+    "cacheHit": false           // true = 命中去重缓存，直接返回已有视频
+  }
+}
+```
+
+**去重逻辑**：`cacheKey = SHA256(productId + style + duration)`，TTL 7 天。命中时 `cacheHit=true`，`data.videoUrl` 直接返回。
+
+---
+
+### GET /api/v1/generate/tasks/{taskId}
+
+查询任务状态（轮询）。
+
+**Response 200**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "taskId": "T1749876543210",
+    "status": "GENERATING",     // PENDING | PREPARING | SCRIPTING | GENERATING | REVIEWING | DONE | FAILED
+    "progress": 65,
+    "currentStep": "video_agent 生成视频片段",
+    "videoUrl": null,           // DONE 后填充
+    "failReason": null
+  }
+}
+```
+
+---
+
+### GET /api/v1/generate/tasks/{taskId}/stream
+
+**SSE 实时进度推送**（长连接，替代轮询）。
+
+```
+Content-Type: text/event-stream
+
+data: {"step":1,"progress":10,"message":"正在获取商品信息"}
+data: {"step":2,"progress":25,"message":"生成视频脚本"}
+data: {"step":3,"progress":40,"message":"并行生成素材"}
+data: {"step":4,"progress":80,"message":"FFmpeg 合成视频"}
+data: {"step":5,"progress":100,"videoUrl":"https://cdn.pixel-step.com/v001.mp4"}
+```
+
+---
+
+### POST /api/v1/generate/image
+
+生成商品场景图（同步，通常 < 10s）。
+
+**Request**
+
+```json
+{
+  "productId": "P001",
+  "scene": "户外草地",
+  "style": "写实",
+  "resolution": "1024x1024"
+}
+```
+
+**Response 200**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "imageUrl": "https://cdn.pixel-step.com/img/P001_20260526.jpg",
+    "generatedAt": "2026-05-26T12:00:05Z"
+  }
+}
+```
+
+---
+
+### POST /api/v1/generate/copy
+
+生成商品文案（同步，通常 < 3s）。
+
+**Request**
+
+```json
+{
+  "productId": "P001",
+  "copyType": "title",          // title | description | hashtag | promotion
+  "tone": "活泼",               // 活泼 | 专业 | 温馨
+  "maxLength": 50
+}
+```
+
+**Response 200**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "copy": "春日限定！这条红裙让你成为最亮的那道光 ✨",
+    "tokens": 128,
+    "model": "deepseek-chat"
+  }
+}
+```
+
+---
+
+## Agent 对话接口
+
+### POST /api/v1/agent/chat
+
+多轮对话入口，Orchestrator 处理意图识别与工具调用。
+
+**Request**
+
+```json
+{
+  "sessionId": "sess-abc123",   // 首次可不传，服务端生成
+  "message": "帮我生成一个展示红色连衣裙的短视频",
+  "context": {
+    "productId": "P001"         // 可选，辅助意图理解
+  }
+}
+```
+
+**Response 200**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "sessionId": "sess-abc123",
+    "reply": "好的，我已为您提交视频生成任务，预计90秒完成。",
+    "taskId": "T1749876543210", // 如触发异步任务
+    "actions": [
+      { "type": "video_generate", "status": "submitted", "taskId": "T1749876543210" }
+    ]
+  }
+}
+```
+
+---
+
+## Webhook & 内部接口
+
+| 接口 | 说明 | 调用方 |
+|------|------|--------|
+| `POST /internal/workflow/callback` | AIGC 任务完成回调，更新 Job 状态 | Content Generator |
+| `POST /internal/inventory/sync` | DB 库存与 Redis 库存对账 | 定时任务 |
+| `POST /internal/outbox/relay` | Relay Worker 轮询投递 | Relay Worker |
+
+<Note>
+  内部接口仅在集群内部网络可访问，API Gateway 层拒绝外部调用（IP 白名单 + mTLS）。
+</Note>

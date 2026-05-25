@@ -1,0 +1,106 @@
+{
+  "$schema": "https://mintlify.com/schema.json",
+  "name": "像素阶跃 AIGC 电商平台",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg"
+  },
+  "favicon": "/logo/favicon.svg",
+  "colors": {
+    "primary": "#8b5cf6",
+    "light": "#d0bfff",
+    "dark": "#5b21b6",
+    "anchors": {
+      "from": "#8b5cf6",
+      "to": "#06b6d4"
+    }
+  },
+  "topbarLinks": [
+    {
+      "name": "GitHub",
+      "url": "https://github.com/HungYann/pixel-docs"
+    }
+  ],
+  "topbarCtaButton": {
+    "name": "架构图",
+    "url": "/architecture/overview"
+  },
+  "tabs": [
+    {
+      "name": "系统设计",
+      "url": "/"
+    }
+  ],
+  "anchors": [
+    {
+      "name": "系统架构",
+      "icon": "sitemap",
+      "url": "architecture"
+    },
+    {
+      "name": "Agent 设计",
+      "icon": "robot",
+      "url": "agent"
+    },
+    {
+      "name": "数据与性能",
+      "icon": "database",
+      "url": "data"
+    }
+  ],
+  "navigation": [
+    {
+      "group": "快速开始",
+      "pages": ["index"]
+    },
+    {
+      "group": "系统架构设计",
+      "pages": [
+        "architecture/overview",
+        "architecture/microservices",
+        "architecture/communication",
+        "architecture/api-design"
+      ]
+    },
+    {
+      "group": "Agent 设计",
+      "pages": [
+        "agent/design",
+        "agent/workflow",
+        "agent/engineering"
+      ]
+    },
+    {
+      "group": "分布式事务与一致性",
+      "pages": [
+        "transactions/saga",
+        "transactions/inventory",
+        "transactions/idempotency"
+      ]
+    },
+    {
+      "group": "数据与性能优化",
+      "pages": [
+        "data/storage",
+        "data/schema",
+        "data/dataflow",
+        "data/performance",
+        "data/cache"
+      ]
+    },
+    {
+      "group": "可观测性",
+      "pages": ["observability/monitoring"]
+    },
+    {
+      "group": "附录",
+      "pages": ["appendix/tech-stack", "appendix/adr"]
+    }
+  ],
+  "footerSocials": {
+    "github": "https://github.com/HungYann/pixel-docs"
+  },
+  "feedback": {
+    "thumbsRating": true
+  }
+}

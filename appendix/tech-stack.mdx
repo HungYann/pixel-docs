@@ -1,0 +1,73 @@
+---
+title: "技术选型总览"
+description: "像素阶跃 AIGC 电商平台完整技术栈及各组件选型理由"
+---
+
+## 完整技术栈
+
+| 类别 | 技术 | 版本 | 用途 |
+|------|------|------|------|
+| **接入层** | Nginx | 1.25 | 反向代理、SSL 终止 |
+| **服务发现** | Consul | 1.18 | 服务注册/发现、健康检查 |
+| **限流熔断** | Sentinel | 1.8 | 流量控制、熔断降级 |
+| **电商服务** | Go 1.22 + Gin | — | 电商侧核心服务（REST API） |
+| **Agent 框架** | Python 3.11 + LangChain | 0.2 | AIGC Agent 编排 |
+| **消息队列** | Apache Kafka | 3.6 | 异步解耦、事务消息 |
+| **关系数据库** | MySQL 8.0 | — | 订单/用户/支付/任务元数据（ShardingSphere 分库） |
+| **缓存 / 队列** | Redis 7.0 Cluster | — | 库存预扣、多级缓存、任务队列、Pub/Sub |
+| **向量检索** | pgvector 0.7 | — | 语义检索、RAG（PostgreSQL 扩展） |
+| **对象存储** | OSS（S3 协议）| — | 图片/视频文件 |
+| **CDN** | 阿里云 CDN | — | 视频边缘加速分发 |
+| **任务队列** | Bull Queue | 4.x | AIGC 异步任务调度（Redis 驱动） |
+| **复杂推理 LLM** | Claude 3.5 Sonnet | — | 多步规划、复杂意图理解 |
+| **多模态 LLM** | Gemini 1.5 Pro | — | 图文理解、视频内容分析 |
+| **成本优先 LLM** | DeepSeek-Chat | V3 | 意图解析、文案生成（高频低复杂） |
+| **视频生成** | 可灵 API / 即梦 | — | 商品视频生成 |
+| **推理服务** | vLLM + Triton | — | GPU 批量推理 |
+| **链路追踪** | OpenTelemetry + Jaeger | — | 分布式链路（TraceId + Request-ID） |
+| **监控告警** | Prometheus + Grafana | — | 指标监控、可视化 |
+| **日志** | ELK Stack | 8.x | 集中日志分析 |
+| **容器化** | Docker + Kubernetes | — | 服务部署、弹性伸缩 |
+| **CI/CD** | GitHub Actions | — | 自动测试、镜像发布 |
+
+---
+
+## 关键选型说明
+
+<AccordionGroup>
+  <Accordion title="为什么电商侧选 Go 而不是 Java？" icon="code">
+    - **性能**：Go 协程天然支持高并发，延迟比 Java Spring Boot 低约 30%
+    - **部署**：Go 编译为单二进制，镜像大小 ~20MB vs Java ~200MB
+    - **内存**：Go GC 暂停时间 < 1ms，Java 在高并发下 GC 压力大
+    - **团队**：Go 语法简单，上手快，适合快速迭代
+  </Accordion>
+  <Accordion title="为什么 Agent 侧选 Python？" icon="code">
+    - **生态**：LangChain、HuggingFace、vLLM 等核心 AI 库全是 Python 首选
+    - **GPU 推理**：PyTorch、CUDA 的 Python 绑定最完整
+    - **开发效率**：AI 产品迭代快，Python 动态特性支持快速实验
+  </Accordion>
+  <Accordion title="为什么服务间通信选 REST 而不是 gRPC？" icon="network-wired">
+    - **调试简单**：REST 可直接用 curl/Postman 测试，gRPC 需要专用工具
+    - **跨语言友好**：Go 和 Python 服务都原生支持 HTTP，无需维护 proto 文件
+    - **性能可接受**：内网延迟 < 1ms，REST 与 gRPC 差距在本场景可忽略
+    - **Webhook 异步**：AIGC 长任务天然适合 Webhook 回调，REST 支持更自然
+  </Accordion>
+  <Accordion title="LLM 如何分层选型？" icon="robot">
+    - **Claude 3.5 Sonnet**：复杂推理、多步任务规划、高质量文案创作（成本较高，用于高价值场景）
+    - **Gemini 1.5 Pro**：图文理解、视频内容分析等多模态任务
+    - **DeepSeek-Chat**：高频低复杂度任务（意图分类、简单文案），成本约为 Claude 的 1/10
+    - **通义千问**：故障切换备用（与 DeepSeek 兼容 OpenAI SDK，切换成本为零）
+  </Accordion>
+  <Accordion title="为什么存储只用 MySQL + Redis？" icon="database">
+    - **MySQL JSON 列**：替代 MongoDB，支持灵活 schema，团队最熟悉
+    - **MySQL FULLTEXT**：替代 Elasticsearch，百万级商品全文搜索性能足够
+    - **Redis 多能力**：String 缓存 + Sorted Set 排行 + List 队列 + Pub/Sub 推送，一套解决
+    - **运维简化**：从 3 套数据库（MySQL + MongoDB + ES）降为 2 套（MySQL + Redis）
+  </Accordion>
+  <Accordion title="为什么向量库选 pgvector 而不是 Milvus？" icon="magnifying-glass">
+    - **运维简单**：pgvector 是 PostgreSQL 扩展，复用现有 PG 运维经验，无需独立部署 Milvus 集群
+    - **规模匹配**：商品向量规模 < 500 万，pgvector + HNSW 索引 P99 < 50ms，完全满足需求
+    - **成本**：省去 Milvus 独立集群的机器和运维成本
+    - **pgvectorscale**：Timescale 的扩展可在需要时进一步提升性能，留有扩展空间
+  </Accordion>
+</AccordionGroup>

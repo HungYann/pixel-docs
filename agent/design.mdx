@@ -1,0 +1,204 @@
+---
+title: "Agent 整体设计"
+description: "基于 ReAct 框架的 Agent 核心构件、知识库分域、意图路由与多 Agent 协作"
+---
+
+## Agent 核心构件
+
+每个 Agent 由四类构件组成，缺一不可：
+
+```mermaid
+graph LR
+    subgraph 构件
+        LLM[LLM\nClaude / Gemini / DeepSeek]
+        KB[知识库\npgvector RAG]
+        MEM[记忆体\n短期:Redis  长期:MySQL]
+        TOOLS[工具注册中心]
+    end
+    LLM <--> KB
+    LLM <--> MEM
+    LLM --> TOOLS
+```
+
+| 构件 | 实现 | 作用 |
+|------|------|------|
+| **LLM** | Claude 3.5 / Gemini 1.5 / DeepSeek | 推理、生成、意图理解 |
+| **知识库** | pgvector + BGE-M3 embedding | 领域知识 RAG 召回 |
+| **记忆体** | 短期：Redis（会话上下文）；长期：MySQL（用户偏好） | 多轮对话连贯性 |
+| **工具** | Tool Registry（JSON Schema 定义） | 执行外部动作 |
+
+---
+
+## 知识库分域设计
+
+知识库按功能角色分区管理，分为**一级域**（共享）和**二级域**（独享）：
+
+```mermaid
+graph TD
+    subgraph L1[一级域  全 Agent 共享]
+        A1[品牌资产<br/>Logo · Slogan · VI 规范]
+        A2[法规合规<br/>平台规则 · 广告法禁词]
+        A3[通用商品知识<br/>类目树 · 属性模板]
+    end
+    subgraph L2[二级域  各 Agent 独享]
+        B1[电商 Agent<br/>SKU · 促销规则 · 定价策略]
+        B2[客服 Agent<br/>FAQ · 退换货 SOP · SLA]
+        B3[视频 Agent<br/>脚本模板 · 风格指南 · 素材库]
+    end
+    L1 --> B1 & B2 & B3
+```
+
+**域隔离规则**：
+- 一级域（L1）：所有 Agent 均可读取，存储品牌通用知识
+- 二级域（L2）：仅归属 Agent 可读取，防止知识污染（如客服 FAQ 不应影响视频生成的脚本风格）
+
+---
+
+## 意图识别与 Agent 路由
+
+Orchestrator 接收用户输入，0-shot 分类后路由到对应 Agent，同时加载 L1 + 对应 L2 知识：
+
+```mermaid
+flowchart LR
+    User[用户输入] --> Intent[意图识别\nLLM 0-shot 分类]
+    Intent -->|电商查询/下单| EC[电商 Agent\nL1 + 电商L2]
+    Intent -->|售后/投诉| CS[客服 Agent\nL1 + 客服L2]
+    Intent -->|内容生成| VG[视频/图片 Agent\nL1 + 视频L2]
+    Intent -->|置信度 < 0.7| CL[澄清对话\n请求用户补充]
+```
+
+**路由输出结构**：
+
+```json
+{
+  "agent_type": "CONTENT_GENERATION",
+  "confidence": 0.97,
+  "domain_level": ["L1", "L2_VIDEO"],
+  "entities": {
+    "product": "连衣裙",
+    "color": "红色",
+    "content_type": "短视频"
+  }
+}
+```
+
+---
+
+## ReAct 推理循环
+
+```mermaid
+flowchart TD
+    Q[用户输入] --> T[Thought\n分析当前状态]
+    T --> A[Action\n选择工具 + 参数]
+    A --> O[Observation\n工具返回结果]
+    O --> D{目标达成?}
+    D -->|否| T
+    D -->|是| R[最终回答]
+    D -->|超过 MAX_STEPS| F[熔断降级\n返回中间结果]
+```
+
+**防无限循环**：
+
+```python
+# 连续 2 步相同 tool + args → 检测到循环
+if history[-2].tool == action.tool and history[-2].args == action.args:
+    return fallback_response("任务执行遇到异常，请重试")
+
+# 超过最大步数 → 返回中间结果
+if step >= MAX_STEPS:
+    return partial_result(context)
+```
+
+---
+
+## Tool 注册中心
+
+Agent 通过 Tool Registry 动态发现和调用工具，LLM 根据工具描述自动选择。
+
+### Tool 定义规范
+
+```json
+{
+  "name": "product_search",
+  "description": "搜索商品库，支持按名称、颜色、类别筛选，返回商品列表含图片 URL",
+  "parameters": {
+    "type": "object",
+    "properties": {
+      "query": {
+        "type": "string",
+        "description": "搜索关键词，如 '红色连衣裙'"
+      },
+      "filters": {
+        "type": "object",
+        "properties": {
+          "color": { "type": "string" },
+          "category": { "type": "string" },
+          "min_price": { "type": "number" },
+          "max_price": { "type": "number" }
+        }
+      },
+      "limit": {
+        "type": "integer",
+        "default": 5,
+        "maximum": 20
+      }
+    },
+    "required": ["query"]
+  }
+}
+```
+
+### 可用工具清单
+
+| 工具名 | 调用的服务 | 返回值 |
+|--------|-----------|--------|
+| `product_search` | Product Service | 商品列表 + 图片 URL |
+| `inventory_query` | Inventory Service | 可用库存数量 |
+| `video_generate` | Content Generator | jobId（异步） |
+| `order_create` | Order Service | orderId + 支付链接 |
+| `vector_search` | pgvector | 语义相似商品列表 |
+| `user_quota_check` | User Service | 视频生成配额 |
+| `kb_query` | pgvector（L1/L2 域） | 知识库召回文档 |
+
+---
+
+## 并行工具调用
+
+多个无依赖关系的工具可以并行执行，减少总耗时：
+
+```python
+# 串行（慢）
+result1 = await product_search(query)   # 200ms
+result2 = await user_quota_check(uid)   # 100ms
+# 总计 300ms
+
+# 并行（快）
+result1, result2 = await asyncio.gather(
+    product_search(query),
+    user_quota_check(uid)
+)
+# 总计 max(200, 100) + 调度开销 ≈ 220ms
+```
+
+---
+
+## 工具调用安全
+
+<Warning>
+  **参数校验**：工具层必须验证所有参数，拒绝非法输入（负数数量、超长文本等）后才传入下游服务。
+</Warning>
+
+```python
+def execute_tool(tool_name: str, args: dict) -> dict:
+    tool = registry.get(tool_name)
+    # 1. JSON Schema 校验参数
+    validate(args, tool.parameters_schema)
+    # 2. 权限检查（用户是否有调用此工具的权限）
+    check_permission(current_user, tool_name)
+    # 3. 频率限制（防止 Agent 循环调用）
+    check_rate_limit(current_session, tool_name)
+    # 4. 执行并记录审计日志
+    result = tool.execute(args)
+    audit_log(tool_name, args, result)
+    return result
+```

@@ -1,0 +1,79 @@
+---
+title: "读写路径分离"
+description: "CQRS 思想下的读写路径设计，商品双写策略，数据流向图"
+---
+
+## 写路径（下单全链路）
+
+```mermaid
+flowchart LR
+    U[用户下单] --> GW[API Gateway]
+    GW --> OS[Order Service]
+    OS --> MySQL[(MySQL 主库\nOrder 记录)]
+    OS --> Redis[(Redis\nDECRBY 库存预扣)]
+    OS --> Outbox[(outbox 表\n事务消息)]
+    Outbox --> RW[Relay Worker]
+    RW --> Kafka[Kafka: order.paid]
+    Kafka --> Orch[Agent Orchestrator\n触发内容生成]
+    Kafka --> Notify[Notify Service\n短信/推送]
+```
+
+## 读路径（商品详情）
+
+```mermaid
+flowchart LR
+    U[用户浏览商品] --> PS[Product Service]
+    PS --> L1[L1: 进程内 LRU\n命中 → 0.1ms]
+    PS --> L2[L2: Redis\n命中 → 1-5ms]
+    PS --> L3[L3: MySQL 读库\n未命中 → 5-50ms]
+    L3 -->|填充| L2
+    L2 -->|填充| L1
+```
+
+## 商品双写策略
+
+商品信息变更时，同步更新 MySQL 主库和 Redis 缓存，异步更新 pgvector 向量：
+
+```python
+class ProductService:
+    async def update_product(self, product: Product):
+        # 1. 写主库
+        await self.mysql.update(product)
+
+        # 2. 更新 Redis 缓存（直写，保持一致）
+        await self.redis.setex(
+            f"product:{product.id}",
+            300,
+            product.to_json()
+        )
+
+        # 3. MySQL FULLTEXT 自动索引，无需额外写入
+
+        # 4. 更新 pgvector 向量（异步，不阻塞响应）
+        asyncio.create_task(
+            self.pgvector.upsert(product.id, self._embed(product))
+        )
+```
+
+<Note>
+  pgvector 向量更新是异步的，允许最多 1 分钟的语义搜索延迟。MySQL / Redis 是同步更新，保证强一致。
+</Note>
+
+## 数据流向总览
+
+```mermaid
+flowchart LR
+    subgraph 写流向
+        W1[用户下单] --> W2[MySQL 主库]
+        W1 --> W3[Redis 库存]
+        W1 --> W4[Kafka 事件]
+        W5[内容生成完成] --> W6[MySQL workflow_tasks]
+        W5 --> W7[OSS 视频文件]
+    end
+    subgraph 读流向
+        R1[用户搜索] --> R2[MySQL FULLTEXT]
+        R1 --> R3[pgvector 语义]
+        R1 --> R4[Redis 热点缓存]
+        R5[用户看视频] --> R6[CDN 就近分发]
+    end
+```

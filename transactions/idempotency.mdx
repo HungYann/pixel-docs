@@ -1,0 +1,127 @@
+---
+title: "幂等与补偿"
+description: "Idempotency-Key 设计、支付回调幂等处理、Outbox Pattern 保证最终一致"
+---
+
+## 为什么需要幂等
+
+网络不可靠导致客户端重试，同一请求可能到达服务端多次：
+
+```
+场景：用户点击"立即支付"按钮，网络超时，前端自动重试
+不幂等：创建了 2 个订单，扣款 2 次
+幂等：无论重试多少次，结果与第 1 次完全相同
+```
+
+---
+
+## Idempotency-Key 方案
+
+```
+客户端生成唯一 Key（UUID）随请求发送：
+POST /orders
+Headers:
+  Idempotency-Key: 550e8400-e29b-41d4-a716-446655440000
+
+服务端处理：
+1. 检查 Redis: key=idempotency:{key} 是否存在
+2. 若存在 → 直接返回缓存结果（不执行业务逻辑）
+3. 若不存在 → 执行业务逻辑 → 结果存入 Redis（TTL 24h）
+```
+
+```python
+def create_order(request: CreateOrderRequest, idempotency_key: str):
+    cache_key = f"idempotency:{idempotency_key}"
+
+    # 检查缓存
+    if cached := redis.get(cache_key):
+        return OrderResponse.from_json(cached)
+
+    # 执行业务逻辑
+    order = order_service.create(request)
+
+    # 缓存结果（TTL 24h）
+    redis.setex(cache_key, 86400, order.to_json())
+    return order
+```
+
+### 各接口幂等键规范
+
+| 接口 | Key 来源 | TTL |
+|------|---------|-----|
+| 创建订单 | 客户端生成 UUID | 24h |
+| 支付回调 | 第三方 tradeNo | 72h |
+| 库存释放 | lock_id（锁定时分配） | 48h |
+| 内容生成 | 参数 SHA256 | 7d |
+
+---
+
+## 支付回调幂等处理
+
+第三方支付（支付宝/微信）的回调可能因网络问题重发多次：
+
+```python
+@app.route('/payments/callback', methods=['POST'])
+def payment_callback():
+    # 1. 验签（防伪造）
+    if not verify_signature(request.data, request.headers):
+        abort(400)
+
+    payload = request.json
+    trade_no = payload['out_trade_no']
+
+    # 2. 幂等检查
+    lock_key = f"callback:lock:{trade_no}"
+    if not redis.set(lock_key, '1', nx=True, ex=259200):  # TTL 72h
+        # 已处理过，直接返回成功（不重复处理）
+        return jsonify({"code": "SUCCESS"})
+
+    # 3. 处理支付结果
+    payment_service.process_paid(trade_no)
+
+    return jsonify({"code": "SUCCESS"})
+```
+
+---
+
+## Outbox Pattern
+
+保证 **DB 写入** 与 **Kafka 消息发布** 的原子性：
+
+```
+传统方案（有问题）：
+  UPDATE payment SET status='PAID'  ← DB 写入
+  kafka.publish('order.paid', ...)  ← 可能失败！
+  → DB 已更新但消息未发出 → 数据不一致
+
+Outbox Pattern（正确）：
+  BEGIN TRANSACTION
+    UPDATE payment SET status='PAID'
+    INSERT INTO outbox (topic, payload) VALUES ('order.paid', ...)
+  COMMIT
+  → 两者在同一事务，原子性由 DB 保证
+
+  Relay Worker（后台）：
+    SELECT * FROM outbox WHERE status='PENDING' LIMIT 100
+    FOR EACH row:
+      kafka.publish(row.topic, row.payload)
+      UPDATE outbox SET status='SENT' WHERE id=row.id
+```
+
+```sql
+CREATE TABLE outbox (
+    id         BIGINT AUTO_INCREMENT PRIMARY KEY,
+    topic      VARCHAR(128) NOT NULL,
+    key_val    VARCHAR(128),
+    payload    JSON NOT NULL,
+    status     ENUM('PENDING', 'SENT', 'FAILED') DEFAULT 'PENDING',
+    attempts   TINYINT DEFAULT 0,
+    created_at DATETIME DEFAULT NOW(),
+    sent_at    DATETIME,
+    INDEX idx_status_created (status, created_at)
+);
+```
+
+<Tip>
+  Relay Worker 每秒轮询一次 `outbox` 表，单次批量处理 100 条。`status=PENDING` 超过 5 分钟的记录视为卡住，触发告警。
+</Tip>

@@ -1,0 +1,107 @@
+---
+title: "库存防超卖"
+description: "Redis Lua 原子脚本 + DB 乐观锁 + 超时释放的三层库存防护方案"
+---
+
+## 超卖场景复现
+
+```
+时间线（库存=1）：
+T1: 用户A 读取库存 → 1（有货）
+T2: 用户B 读取库存 → 1（有货）
+T3: 用户A 下单扣减 → 库存变为 0
+T4: 用户B 下单扣减 → 库存变为 -1 ← 超卖！
+```
+
+---
+
+## 三层防护
+
+### 第一层：Redis 原子预扣（主力，推荐）
+
+使用 Lua 脚本保证"检查+扣减"的原子性：
+
+```lua
+-- inventory_lock.lua
+local key = KEYS[1]        -- "stock:sku:SKU001"
+local amount = tonumber(ARGV[1])
+
+local current = tonumber(redis.call('GET', key))
+
+if current == nil then
+  return -2  -- key 不存在（缓存未初始化）
+end
+
+if current < amount then
+  return -1  -- 库存不足，拒绝
+end
+
+-- 原子扣减，返回剩余库存
+return redis.call('DECRBY', key, amount)
+```
+
+```python
+# 调用方式
+result = redis.eval(lua_script, 1, f"stock:sku:{sku_id}", amount)
+if result == -1:
+    raise InsufficientInventoryError()
+elif result == -2:
+    # 回源 DB 初始化缓存后重试
+    init_stock_cache(sku_id)
+```
+
+### 第二层：DB 乐观锁兜底
+
+Redis 扣减成功后，异步同步到 DB（保证最终一致）：
+
+```sql
+UPDATE inventory
+SET available = available - :amount,
+    version   = version + 1
+WHERE sku_id = :sku_id
+  AND available >= :amount
+  AND version   = :expected_version;
+-- UPDATE 返回 0 行 → 并发冲突 → 回滚
+```
+
+### 第三层：预占超时自动释放
+
+```
+Redis Key: stock:sku:SKU001 TTL 永久（库存数量）
+Lock Key:  stock:lock:{orderId} TTL = 15分钟
+
+用户下单 → 扣减 stock:sku → 创建 lock key
+用户支付 → 实际扣减 DB → 删除 lock key
+超时未付 → lock key TTL 到期 → 补偿任务归还库存
+```
+
+---
+
+## 性能对比
+
+| 方案 | TPS（10 万 SKU 场景） | 缺点 |
+|------|---------------------|------|
+| SELECT FOR UPDATE | ~800 | 长事务锁，死锁风险高 |
+| 乐观锁 CAS | ~3,000 | 冲突多时重试成本高 |
+| **Redis DECRBY（推荐）** | **~50,000** | Redis 宕机需降级 |
+
+---
+
+## Redis 宕机降级
+
+```python
+def lock_inventory(sku_id: str, amount: int) -> bool:
+    try:
+        # 优先走 Redis 原子操作
+        result = redis_lock(sku_id, amount)
+        return result >= 0
+    except RedisConnectionError:
+        # Redis 宕机：降级到 DB 悲观锁
+        logger.warning("Redis unavailable, fallback to DB pessimistic lock")
+        metrics.increment('inventory.redis.fallback')
+        return db_pessimistic_lock(sku_id, amount)
+```
+
+<Warning>
+  降级到 DB 悲观锁会导致 TPS 下降约 60 倍，应立即触发告警并快速恢复 Redis。
+</Warning>

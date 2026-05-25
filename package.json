@@ -1,0 +1,13 @@
+{
+  "name": "pixel-tech-aigc-docs",
+  "version": "1.0.0",
+  "description": "像素阶跃 AIGC 电商平台系统设计文档",
+  "scripts": {
+    "dev": "mintlify dev",
+    "build": "mintlify export && mkdir -p out && unzip -q export.zip -d out",
+    "start": "mintlify dev"
+  },
+  "devDependencies": {
+    "mintlify": "^4.2.577"
+  }
+}

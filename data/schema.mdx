@@ -1,0 +1,253 @@
+---
+title: "核心表结构设计"
+description: "订单、支付、库存、工作流任务、AI 生成任务的完整表结构与索引设计"
+---
+
+## 设计原则
+
+- 所有主键使用**雪花算法**（Snowflake ID），避免分布式场景的主键冲突
+- 写操作字段统一加 `request_id` 便于链路排查
+- 软删除使用 `deleted_at` 字段，物理删除仅用于过期归档
+- 金额字段统一使用 `DECIMAL(12,2)`，不使用 `FLOAT`
+
+---
+
+## 电商侧（PostgreSQL 16）
+
+### orders 订单表
+
+```sql
+CREATE TABLE orders (
+    order_id        BIGINT          PRIMARY KEY,            -- Snowflake ID
+    user_id         BIGINT          NOT NULL,
+    status          VARCHAR(20)     NOT NULL DEFAULT 'PENDING',
+    -- PENDING | PAID | FULFILLING | COMPLETED | CANCELLED
+    total_amount    DECIMAL(12,2)   NOT NULL,
+    discount_amount DECIMAL(12,2)   NOT NULL DEFAULT 0,
+    pay_amount      DECIMAL(12,2)   NOT NULL,               -- 实付金额
+    address_id      BIGINT          NOT NULL,
+    coupon_code     VARCHAR(50),
+    idempotency_key VARCHAR(64)     NOT NULL UNIQUE,        -- 幂等键
+    request_id      VARCHAR(64),                            -- 链路追踪
+    paid_at         TIMESTAMPTZ,
+    cancelled_at    TIMESTAMPTZ,
+    cancel_reason   VARCHAR(200),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_orders_user_created  ON orders (user_id, created_at DESC);
+CREATE INDEX idx_orders_status        ON orders (status) WHERE status IN ('PENDING', 'PAID');
+```
+
+### order_items 订单明细表
+
+```sql
+CREATE TABLE order_items (
+    item_id     BIGINT          PRIMARY KEY,
+    order_id    BIGINT          NOT NULL REFERENCES orders(order_id),
+    product_id  BIGINT          NOT NULL,
+    sku_id      BIGINT          NOT NULL,
+    sku_name    VARCHAR(200)    NOT NULL,
+    quantity    INT             NOT NULL CHECK (quantity > 0),
+    unit_price  DECIMAL(12,2)  NOT NULL,
+    subtotal    DECIMAL(12,2)  NOT NULL,
+    created_at  TIMESTAMPTZ    NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_order_items_order ON order_items (order_id);
+```
+
+---
+
+### payments 支付表
+
+```sql
+CREATE TABLE payments (
+    payment_id      BIGINT          PRIMARY KEY,
+    order_id        BIGINT          NOT NULL UNIQUE,
+    user_id         BIGINT          NOT NULL,
+    channel         VARCHAR(20)     NOT NULL,   -- alipay | wechat | stripe
+    status          VARCHAR(20)     NOT NULL DEFAULT 'INIT',
+    -- INIT | PENDING | SUCCESS | FAILED | REFUNDED
+    pay_amount      DECIMAL(12,2)   NOT NULL,
+    currency        CHAR(3)         NOT NULL DEFAULT 'CNY',
+    channel_trade_no VARCHAR(100),              -- 支付渠道流水号
+    channel_raw     JSONB,                      -- 渠道原始回调报文
+    paid_at         TIMESTAMPTZ,
+    refund_amount   DECIMAL(12,2)   DEFAULT 0,
+    refunded_at     TIMESTAMPTZ,
+    idempotency_key VARCHAR(64)     NOT NULL UNIQUE,
+    request_id      VARCHAR(64),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_payments_order    ON payments (order_id);
+CREATE INDEX idx_payments_channel  ON payments (channel, channel_trade_no);
+```
+
+---
+
+### inventories 库存表
+
+```sql
+CREATE TABLE inventories (
+    sku_id      BIGINT          PRIMARY KEY,
+    product_id  BIGINT          NOT NULL,
+    total       INT             NOT NULL DEFAULT 0,
+    available   INT             NOT NULL DEFAULT 0,     -- 可售库存
+    locked      INT             NOT NULL DEFAULT 0,     -- 预占库存
+    version     BIGINT          NOT NULL DEFAULT 0,     -- 乐观锁版本
+    updated_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_inventory CHECK (
+        available >= 0 AND locked >= 0 AND total = available + locked
+    )
+);
+
+-- 库存预占记录（支持超时释放）
+CREATE TABLE inventory_locks (
+    lock_id     BIGINT          PRIMARY KEY,
+    sku_id      BIGINT          NOT NULL,
+    order_id    BIGINT          NOT NULL,
+    quantity    INT             NOT NULL,
+    status      VARCHAR(20)     NOT NULL DEFAULT 'LOCKED',  -- LOCKED | RELEASED | DEDUCTED
+    expire_at   TIMESTAMPTZ     NOT NULL,                   -- 15 分钟后自动释放
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_inv_locks_sku_order ON inventory_locks (sku_id, order_id);
+CREATE INDEX idx_inv_locks_expire    ON inventory_locks (expire_at) WHERE status = 'LOCKED';
+```
+
+---
+
+### outbox 事务消息表
+
+```sql
+CREATE TABLE outbox (
+    id          BIGSERIAL       PRIMARY KEY,
+    topic       VARCHAR(100)    NOT NULL,    -- Kafka topic
+    payload     JSONB           NOT NULL,
+    status      VARCHAR(20)     NOT NULL DEFAULT 'PENDING',  -- PENDING | SENT
+    retry_count INT             NOT NULL DEFAULT 0,
+    created_at  TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    sent_at     TIMESTAMPTZ
+);
+
+CREATE INDEX idx_outbox_pending ON outbox (created_at) WHERE status = 'PENDING';
+```
+
+---
+
+## AIGC 侧（MySQL）
+
+使用 MySQL JSON 列存储灵活 schema，替代 MongoDB。
+
+### workflow_tasks 工作流任务表
+
+```sql
+CREATE TABLE workflow_tasks (
+    task_id      BIGINT       PRIMARY KEY,                   -- Snowflake ID
+    user_id      BIGINT       NOT NULL,
+    type         VARCHAR(30)  NOT NULL,                      -- VIDEO_GENERATION | IMAGE_GENERATION | COPY_WRITING
+    status       VARCHAR(20)  NOT NULL DEFAULT 'PENDING',   -- PENDING | SCRIPTING | GENERATING | REVIEWING | DONE | FAILED
+    priority     TINYINT      NOT NULL DEFAULT 1,            -- 0=低 1=普通 2=高
+    progress     TINYINT      NOT NULL DEFAULT 0,
+    input_json   JSON         NOT NULL,                      -- { productId, style, duration, promptHints }
+    steps_json   JSON,                                       -- 各步骤执行记录（seq, tool, status, latencyMs）
+    output_json  JSON,                                       -- 完成后的输出 { videoUrl, fileSize }
+    error_msg    VARCHAR(500),
+    retry_count  TINYINT      NOT NULL DEFAULT 0,
+    max_retries  TINYINT      NOT NULL DEFAULT 3,
+    cache_key    VARCHAR(64),                                 -- SHA256(productId+style+duration) 去重
+    request_id   VARCHAR(64),
+    created_at   DATETIME     DEFAULT NOW(),
+    updated_at   DATETIME     DEFAULT NOW() ON UPDATE NOW(),
+    INDEX idx_user_status  (user_id, status),
+    INDEX idx_status_prio  (status, priority DESC, created_at),
+    INDEX idx_cache_key    (cache_key)
+);
+```
+
+**JSON 列示例值**：
+
+```json
+// input_json
+{ "productId": "P001", "style": "展示类", "duration": 30, "promptHints": "突出红色质感" }
+
+// steps_json
+[
+  { "seq": 1, "tool": "product_search", "status": "DONE", "latencyMs": 180 },
+  { "seq": 2, "tool": "script_generate", "status": "DONE", "latencyMs": 2300 },
+  { "seq": 3, "tool": "video_agent", "status": "RUNNING" }
+]
+
+// output_json（DONE 后填充）
+{ "videoUrl": "oss://pixel-step/content/v001.mp4", "fileSize": 12345678, "durationMs": 30000 }
+```
+
+---
+
+### ai_generation_tasks AI 生成子任务表
+
+每个 `workflow_task` 可拆分为多个并行子任务（图片 / 视频 / 配音）：
+
+```sql
+CREATE TABLE ai_generation_tasks (
+    sub_task_id      BIGINT       PRIMARY KEY,
+    workflow_task_id BIGINT       NOT NULL,
+    type             VARCHAR(20)  NOT NULL,   -- VIDEO_CLIP | IMAGE_SCENE | TTS_AUDIO | SUBTITLE
+    status           VARCHAR(20)  NOT NULL DEFAULT 'PENDING',
+    model_used       VARCHAR(50),             -- kling-api | jimeng | sd-webui | tts-service
+    prompt           TEXT,
+    input_json       JSON,
+    output_json      JSON,
+    cost_cent        INT          DEFAULT 0,  -- 单位：分，用于成本统计
+    latency_ms       INT,
+    created_at       DATETIME     DEFAULT NOW(),
+    done_at          DATETIME,
+    INDEX idx_workflow (workflow_task_id)
+);
+```
+
+---
+
+## 向量存储（PostgreSQL + pgvector）
+
+### product_embeddings 商品向量表
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+
+CREATE TABLE product_embeddings (
+    product_id  BIGINT      PRIMARY KEY,
+    embedding   vector(768),            -- BGE-M3 嵌入向量
+    text_repr   TEXT,                   -- 用于生成 embedding 的文本快照
+    metadata    JSONB,                  -- 商品名称、类目、价格等过滤字段
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- HNSW 索引：P99 < 50ms（< 500 万向量）
+CREATE INDEX idx_product_emb_hnsw
+    ON product_embeddings
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 64);
+
+-- 支持按类目过滤的组合查询
+CREATE INDEX idx_product_emb_meta ON product_embeddings USING gin (metadata);
+```
+
+---
+
+## 缓存键规范（Redis）
+
+| 用途 | Key 格式 | TTL |
+|------|---------|-----|
+| 商品缓存 | `product:{productId}` | 300s + random(60) |
+| 库存预扣 | `stock:sku:{skuId}` | 永久（库存归零删除） |
+| 库存锁 | `inv_lock:{orderId}:{skuId}` | 900s（15分钟） |
+| 幂等结果 | `idempotent:{service}:{key}` | 86400s（24小时） |
+| 内容去重 | `content:dedup:{sha256}` | 604800s（7天） |
+| Session | `session:{sessionId}` | 1800s（30分钟，活跃续期） |
+| 限流计数 | `ratelimit:{userId}:{minute}` | 60s |
