@@ -141,7 +141,7 @@ API Gateway ── 生成 X-Request-ID: req-xxxx ──▶ gRPC metadata: reques
 
 ### 3.3 API 接口设计规范
 
-所有接口以 `/api/v1/` 为前缀，详见完整文档 [API 接口设计规范](https://pixel.docs.agentdna.store/architecture/api-design)。
+所有接口以 `/api/v1/` 为前缀，详见完整文档 API 接口设计规范。
 
 **核心接口清单**
 
@@ -170,6 +170,11 @@ graph TD
 ```
 
 ---
+
+整体架构
+
+![](systemdesign.png)
+
 
 ## 4. Agent 设计
 
