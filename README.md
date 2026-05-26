@@ -2,7 +2,7 @@
 
 > 电商网站: **[https://pixel.agentdna.store](https://pixel.agentdna.store)**
 
-> 完整交互式文档：**[pixel.docs.agentdna.store](https://pixel.docs.agentdna.store)**
+> 完整交互式文档：**[https://pixel.docs.agentdna.store](https://pixel.docs.agentdna.store)**
 
 ---
 
@@ -689,7 +689,7 @@ def route_llm_request(task: LLMTask) -> str:
 
 ## 附录：架构决策记录（ADR）
 
-### ADR-002：向量库选 pgvector 而非 Milvus
+### ADR-001：向量库选 pgvector 而非 Milvus
 
 **决策**：使用 pgvector（PostgreSQL 16 扩展），不引入独立 Milvus 集群。
 
@@ -699,7 +699,7 @@ def route_llm_request(task: LLMTask) -> str:
 - 省去 Milvus 独立集群的机器和运维成本
 - pgvectorscale 扩展预留了未来亿级扩展的能力
 
-### ADR-003：LLM 分层选型策略
+### ADR-002：LLM 分层选型策略
 
 **决策**：按任务复杂度和模态分层选用不同 LLM，而非一刀切。
 
